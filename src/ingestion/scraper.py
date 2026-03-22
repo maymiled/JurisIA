@@ -99,6 +99,9 @@ class PISTEScraper:
 
     def _post(self, endpoint: str, payload: dict) -> dict:
         resp = self.session.post(f"{PISTE_API_BASE}/{endpoint}", json=payload)
+        if resp.status_code == 401:
+            self.authenticate()
+            resp = self.session.post(f"{PISTE_API_BASE}/{endpoint}", json=payload)
         resp.raise_for_status()
         return resp.json()
 
@@ -109,18 +112,26 @@ class PISTEScraper:
         )
 
     def fetch_article(self, article_id: str) -> dict:
-        return self._post("consult/getArticle", {"id": article_id})
+        resp = self._post("consult/getArticle", {"id": article_id})
+        return resp.get("article", resp)
 
     def scrape_all(self, output_file: str = "code_travail_raw.json") -> Path:
         """Parcourt tout le Code du travail et sauvegarde les articles."""
         if not self.token:
             self.authenticate()
 
+        print("Récupération de la table des matières...")
         toc = self.fetch_table_of_contents()
         articles = []
 
-        def traverse(sections: list) -> None:
+        out = RAW_DIR / output_file
+        pbar = tqdm(desc="Articles scrapés", unit="art")
+
+        def traverse(sections: list, depth: int = 0) -> None:
             for section in sections:
+                title = section.get("title", "")
+                if depth == 0:
+                    print(f"\n── {title}")
                 for article in section.get("articles", []):
                     try:
                         full = self.fetch_article(article["id"])
@@ -132,12 +143,18 @@ class PISTEScraper:
                             "source": "piste_api",
                             "url": f"https://www.legifrance.gouv.fr/codes/article_lc/{full.get('num', '')}",
                         })
+                        pbar.update(1)
+                        # Sauvegarde incrémentale toutes les 500 articles
+                        if len(articles) % 500 == 0:
+                            with open(out, "w", encoding="utf-8") as f:
+                                json.dump(articles, f, ensure_ascii=False)
                         time.sleep(0.1)
                     except Exception as e:
                         print(f"Erreur article {article.get('id')}: {e}")
-                traverse(section.get("sections", []))
+                traverse(section.get("sections", []), depth + 1)
 
         traverse(toc.get("sections", []))
+        pbar.close()
 
         out = RAW_DIR / output_file
         with open(out, "w", encoding="utf-8") as f:
