@@ -1,17 +1,15 @@
 """
 Scraper du Code du travail depuis Légifrance.
 
-Deux stratégies disponibles :
-1. API PISTE (officielle DILA) — nécessite des credentials OAuth2
-2. data.gouv.fr — dump XML open data, aucune auth requise (recommandé pour démarrer)
+Stratégies disponibles (par ordre de simplicité) :
+1. HuggingFace dataset (manu/dila_legifrance) — aucune auth, recommandé pour démarrer
+2. API PISTE officielle DILA — nécessite des credentials OAuth2
+3. Scraping HTML legifrance.gouv.fr — fallback
 """
 
 import json
-import os
 import time
-import zipfile
 from pathlib import Path
-from typing import Generator
 
 import requests
 from tqdm import tqdm
@@ -19,22 +17,64 @@ from tqdm import tqdm
 RAW_DIR = Path(__file__).parents[2] / "data" / "raw"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-# URL du dump XML du Code du travail sur data.gouv.fr (Légifrance open data)
-LEGI_DUMP_URL = (
-    "https://echanges.dila.gouv.fr/OPENDATA/LEGI/Freemium_legi_global_20171201-162124.tar.gz"
-)
-
 # API PISTE — base URL
 PISTE_TOKEN_URL = "https://oauth.piste.gouv.fr/api/oauth/token"
 PISTE_API_BASE = "https://api.piste.gouv.fr/dila/legifrance/lf-engine-app"
-
 CODE_TRAVAIL_ID = "LEGITEXT000006072050"
 
+HF_DATASET_ID = "manu/dila_legifrance"
 
-# ── Stratégie 1 : API PISTE ──────────────────────────────────────────────────
+
+# ── Stratégie 1 : HuggingFace dataset (recommandée) ─────────────────────────
+
+def fetch_code_travail_huggingface(output_file: str = "code_travail_raw.json") -> Path:
+    """
+    Télécharge les articles du Code du travail depuis le dataset HuggingFace
+    manu/dila_legifrance — aucune auth requise.
+
+    Nécessite : pip install datasets
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("Lance : pip install datasets")
+
+    print(f"Chargement du dataset HuggingFace {HF_DATASET_ID}...")
+    ds = load_dataset(HF_DATASET_ID, split="train", trust_remote_code=True)
+
+    articles = []
+    for item in tqdm(ds, desc="Filtrage Code du travail"):
+        # Garder uniquement les articles du Code du travail
+        nature = item.get("nature", "")
+        titre = item.get("titre", item.get("title", ""))
+        if "TRAVAIL" not in str(titre).upper() and "travail" not in str(nature).lower():
+            # Filtrer par identifiant légifrance si disponible
+            cid = item.get("cid", item.get("textId", ""))
+            if CODE_TRAVAIL_ID not in str(cid):
+                continue
+
+        articles.append({
+            "id": item.get("id", item.get("cid", "")),
+            "number": item.get("num", item.get("numero", "")),
+            "title": titre,
+            "content": item.get("texte", item.get("text", item.get("content", ""))),
+            "source": "huggingface_dila",
+            "url": f"https://www.legifrance.gouv.fr/codes/article_lc/{item.get('num', '')}",
+            "theme": item.get("section", ""),
+        })
+
+    out = RAW_DIR / output_file
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+
+    print(f"\n{len(articles)} articles sauvegardés → {out}")
+    return out
+
+
+# ── Stratégie 2 : API PISTE officielle ──────────────────────────────────────
 
 class PISTEScraper:
-    """Scraper via l'API officielle PISTE de la DILA."""
+    """Scraper via l'API officielle PISTE de la DILA (nécessite credentials)."""
 
     def __init__(self, client_id: str, client_secret: str):
         self.client_id = client_id
@@ -55,56 +95,49 @@ class PISTEScraper:
         resp.raise_for_status()
         self.token = resp.json()["access_token"]
         self.session.headers.update({"Authorization": f"Bearer {self.token}"})
+        print("Authentification PISTE OK")
 
-    def _get(self, endpoint: str, payload: dict) -> dict:
+    def _post(self, endpoint: str, payload: dict) -> dict:
         resp = self.session.post(f"{PISTE_API_BASE}/{endpoint}", json=payload)
         resp.raise_for_status()
         return resp.json()
 
     def fetch_table_of_contents(self) -> dict:
-        """Récupère la table des matières du Code du travail."""
-        return self._get(
+        return self._post(
             "consult/code/tableMatieres",
             {"textId": CODE_TRAVAIL_ID, "date": "2024-01-01"},
         )
 
     def fetch_article(self, article_id: str) -> dict:
-        """Récupère le contenu d'un article par son ID Légifrance."""
-        return self._get("consult/getArticle", {"id": article_id})
+        return self._post("consult/getArticle", {"id": article_id})
 
-    def fetch_section_articles(self, section_id: str) -> list[dict]:
-        """Récupère tous les articles d'une section."""
-        data = self._get(
-            "consult/code/section/id",
-            {"sectionId": section_id, "textId": CODE_TRAVAIL_ID, "date": "2024-01-01"},
-        )
-        return data.get("articles", [])
-
-    def scrape_all_articles(self, output_file: str = "code_travail_articles.json") -> Path:
-        """
-        Parcourt tout le Code du travail et sauvegarde les articles en JSON.
-        Retourne le chemin du fichier créé.
-        """
+    def scrape_all(self, output_file: str = "code_travail_raw.json") -> Path:
+        """Parcourt tout le Code du travail et sauvegarde les articles."""
         if not self.token:
             self.authenticate()
 
         toc = self.fetch_table_of_contents()
         articles = []
 
-        def traverse_sections(sections: list) -> None:
+        def traverse(sections: list) -> None:
             for section in sections:
-                # Articles directs dans la section
                 for article in section.get("articles", []):
                     try:
                         full = self.fetch_article(article["id"])
-                        articles.append(full)
-                        time.sleep(0.1)  # rate limiting
+                        articles.append({
+                            "id": full.get("id", ""),
+                            "number": full.get("num", ""),
+                            "title": full.get("titre", ""),
+                            "content": full.get("texte", ""),
+                            "source": "piste_api",
+                            "url": f"https://www.legifrance.gouv.fr/codes/article_lc/{full.get('num', '')}",
+                        })
+                        time.sleep(0.1)
                     except Exception as e:
                         print(f"Erreur article {article.get('id')}: {e}")
-                # Sous-sections récursives
-                traverse_sections(section.get("sections", []))
+                traverse(section.get("sections", []))
 
-        traverse_sections(toc.get("sections", []))
+        traverse(toc.get("sections", []))
 
         out = RAW_DIR / output_file
         with open(out, "w", encoding="utf-8") as f:
@@ -114,136 +147,70 @@ class PISTEScraper:
         return out
 
 
-# ── Stratégie 2 : Scraping direct HTML Légifrance ────────────────────────────
+# ── Stratégie 3 : HuggingFace sans filtre (plus simple) ──────────────────────
 
-class LegifranceScraper:
+def fetch_all_articles_hf_simple(output_file: str = "code_travail_raw.json") -> Path:
     """
-    Scraper HTML de legifrance.gouv.fr.
-    Fallback quand on n'a pas de credentials PISTE.
+    Charge les articles du Code du travail via la lib `datasets` HuggingFace
+    en mode streaming — pas de credentials requis, gère la pagination automatiquement.
+
+    Nécessite : pip install datasets
+    Le dataset contient 2.3M entrées (tout DILA) — on filtre sur les IDs Code du travail.
+    IDs du Code du travail : commencent par LEGIARTI et appartiennent au code LEGITEXT000006072050.
     """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("Lance d'abord : pip install datasets")
 
-    BASE_URL = "https://www.legifrance.gouv.fr"
-    HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (compatible; JurisIA-research-bot/1.0; "
-            "+https://github.com/yourname/jurisia)"
-        )
-    }
+    import re
 
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update(self.HEADERS)
-
-    def fetch_article_by_number(self, article_num: str) -> dict | None:
-        """
-        Récupère un article via l'URL de recherche Légifrance.
-        Ex: article_num = "L1221-1"
-        """
-        url = f"{self.BASE_URL}/codes/article_lc/{article_num}"
-        try:
-            resp = self.session.get(url, timeout=10)
-            resp.raise_for_status()
-            return self._parse_article_html(resp.text, article_num)
-        except requests.RequestException as e:
-            print(f"Erreur HTTP pour {article_num}: {e}")
-            return None
-
-    def _parse_article_html(self, html: str, article_num: str) -> dict:
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(html, "lxml")
-
-        # Contenu principal de l'article
-        content_div = soup.find("div", class_="content-article")
-        content = content_div.get_text(separator="\n", strip=True) if content_div else ""
-
-        # Titre / numéro
-        title_el = soup.find("h1", class_="title-article")
-        title = title_el.get_text(strip=True) if title_el else article_num
-
-        return {
-            "id": article_num,
-            "number": article_num,
-            "title": title,
-            "content": content,
-            "source": "legifrance_html",
-        }
-
-
-# ── Stratégie 3 : Open Data LEGI (recommandée Day 1) ────────────────────────
-
-def iter_articles_from_json_dump(dump_path: Path) -> Generator[dict, None, None]:
-    """
-    Itère sur les articles depuis un dump JSON pré-traité.
-    Format attendu : liste d'objets avec au moins 'number', 'content', 'title'.
-    """
-    with open(dump_path, encoding="utf-8") as f:
-        articles = json.load(f)
-    for article in articles:
-        yield article
-
-
-def fetch_code_travail_opendata() -> Path:
-    """
-    Télécharge les articles du Code du travail depuis l'API ouverte
-    de beta.gouv / data.economie.gouv ou équivalent.
-
-    Alternative simple : utilise l'API non-officielle du Code du travail
-    (https://github.com/SocialGouv/code-du-travail-numerique).
-    """
-    # API du Code du travail numérique (Ministère du Travail)
-    # Endpoint public, pas d'auth requise
-    API_URL = "https://api.code-du-travail.gouv.fr/api/v1/search"
+    # Pattern des articles du Code du travail dans le texte
+    # Le texte contient généralement "Article L/R/D XXXX-X" ou l'ID LEGIARTI
+    CODE_TRAVAIL_PATTERN = re.compile(
+        r"Article\s+[LRD]\d{3,4}[- ]\d+|"
+        r"Code du travail|"
+        r"L\.\s*\d{4}[- ]\d+",
+        re.IGNORECASE
+    )
 
     articles = []
-    page = 0
-    page_size = 100
+    print(f"Streaming du dataset {HF_DATASET_ID} (filtrage Code du travail)...")
+    print("Note : dataset volumineux, filtrage en cours — peut prendre quelques minutes.")
 
-    print("Téléchargement des articles via l'API Code du travail numérique...")
+    ds = load_dataset(HF_DATASET_ID, split="train", streaming=True, trust_remote_code=True)
 
-    with tqdm(desc="Articles") as pbar:
-        while True:
-            try:
-                resp = requests.get(
-                    API_URL,
-                    params={
-                        "q": "",
-                        "sources": "code_du_travail",
-                        "page": page,
-                        "pageSize": page_size,
-                    },
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+    with tqdm(desc="Articles trouvés") as pbar:
+        for item in ds:
+            item_id = item.get("id", "")
+            text = item.get("text", "")
 
-                results = data.get("results", [])
-                if not results:
-                    break
+            if not text:
+                continue
 
-                for item in results:
-                    articles.append({
-                        "id": item.get("id", ""),
-                        "number": item.get("slug", ""),
-                        "title": item.get("title", ""),
-                        "content": item.get("text", ""),
-                        "source": "code_du_travail_numerique",
-                        "url": item.get("url", ""),
-                        "theme": item.get("theme", ""),
-                    })
+            # Filtrer : garde uniquement les articles du Code du travail
+            if not CODE_TRAVAIL_PATTERN.search(text[:500]):
+                continue
 
-                pbar.update(len(results))
-                page += 1
-                time.sleep(0.2)
+            # Extraire le numéro d'article depuis le texte
+            num_match = re.search(r'Article\s+([LRD]\d{3,4}[-]\d+(?:[-]\d+)?)', text)
+            article_num = num_match.group(1) if num_match else item_id
 
-                if len(results) < page_size:
-                    break
+            articles.append({
+                "id": item_id,
+                "number": article_num,
+                "title": f"Article {article_num}",
+                "content": text,
+                "source": "huggingface_dila",
+                "url": f"https://www.legifrance.gouv.fr/codes/article_lc/{article_num}",
+            })
+            pbar.update(1)
 
-            except Exception as e:
-                print(f"\nErreur page {page}: {e}")
+            # Objectif : ~3000 articles pour le livrable Jour 1-2
+            if len(articles) >= 3500:
                 break
 
-    out = RAW_DIR / "code_travail_raw.json"
+    out = RAW_DIR / output_file
     with open(out, "w", encoding="utf-8") as f:
         json.dump(articles, f, ensure_ascii=False, indent=2)
 
@@ -252,6 +219,21 @@ def fetch_code_travail_opendata() -> Path:
 
 
 if __name__ == "__main__":
-    # Lancement rapide : open data sans credentials
-    out_path = fetch_code_travail_opendata()
-    print(f"Fichier créé : {out_path}")
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    client_id = os.getenv("PISTE_CLIENT_ID")
+    client_secret = os.getenv("PISTE_CLIENT_SECRET")
+
+    if client_id and client_secret:
+        # Option 1 : API officielle PISTE
+        print("Utilisation de l'API PISTE (credentials trouvés)...")
+        scraper = PISTEScraper(client_id, client_secret)
+        out_path = scraper.scrape_all()
+    else:
+        # Option 2 : HuggingFace sans credentials
+        print("Pas de credentials PISTE — utilisation de HuggingFace...")
+        out_path = fetch_all_articles_hf_simple()
+
+    print(f"\nFichier créé : {out_path}")
