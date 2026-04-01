@@ -83,19 +83,21 @@ Question : {question}
 Réponds en citant les articles entre crochets [Article XXX]."""
 
 
-def ask(question: str, stream: bool = False) -> str:
+def ask(question: str, stream: bool = False, chunks: list[dict] | None = None) -> str:
     """
     Pipeline RAG complet : question → articles → réponse LLM.
 
     Args:
         question: La question juridique de l'utilisateur
         stream: Si True, affiche la réponse en streaming dans le terminal
+        chunks: Chunks déjà récupérés (évite un double appel à retrieve)
 
     Returns:
         La réponse complète sous forme de string
     """
-    # 1. Retrieval
-    chunks = retrieve(question)
+    # 1. Retrieval (sauf si déjà fourni)
+    if chunks is None:
+        chunks = retrieve(question)
 
     if not chunks:
         return "Aucun article pertinent trouvé dans le Code du travail."

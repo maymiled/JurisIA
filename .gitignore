@@ -26,6 +26,7 @@ env/
 data/raw/*.json
 data/raw/*.xml
 data/processed/*.pkl
+data/processed/*.json
 data/embeddings/
 models/
 *.bin
