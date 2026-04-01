@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements-api.txt
 
 COPY src/ src/
 COPY start.sh .
+# cache-bust: fa8d822
 RUN chmod +x start.sh
 
 RUN mkdir -p data/embeddings
