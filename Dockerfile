@@ -9,9 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements-api.txt .
 RUN pip install --no-cache-dir -r requirements-api.txt
 
+ARG CACHEBUST=2
 COPY src/ src/
 COPY start.sh .
-# cache-bust: fa8d822
 RUN chmod +x start.sh
 
 RUN mkdir -p data/embeddings
