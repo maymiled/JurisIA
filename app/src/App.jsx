@@ -27,8 +27,8 @@ export default function App() {
     setLoading(true)
 
     try {
-      const apiBase = import.meta.env.VITE_API_URL ?? ''
-      const res = await fetch(`${apiBase}/api/ask`, {
+      const apiBase = import.meta.env.VITE_API_URL ?? 'https://jurisia.onrender.com'
+      const res = await fetch(`${apiBase}/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question }),

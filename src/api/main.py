@@ -7,6 +7,7 @@ Endpoints :
 """
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sys
 from pathlib import Path
@@ -22,6 +23,13 @@ app = FastAPI(
     title="JurisIA",
     description="Assistant juridique IA spécialisé en droit du travail français",
     version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ── Schémas ───────────────────────────────────────────────────────────────────
